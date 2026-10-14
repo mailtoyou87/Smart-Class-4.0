@@ -1,0 +1,29 @@
+# New staging deployment; do not replace the existing Smart Class 3.1 service.
+services:
+  - type: web
+    name: smart-class-v4-staging
+    runtime: python
+    plan: free
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: cd backend && python bootstrap_demo.py && uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: smart-class-v4-staging-db
+          property: connectionString
+      - key: SMART_SECRET
+        generateValue: true
+      - key: SMART_HTTPS
+        value: "1"
+      - key: SMART_ENV
+        value: staging
+      - key: SMART_DEMO_SEED
+        value: "YES"
+      - key: PYTHON_VERSION
+        value: "3.11.11"
+databases:
+  - name: smart-class-v4-staging-db
+    plan: free
+    databaseName: smart_class_v4
+    user: smart_class_v4
