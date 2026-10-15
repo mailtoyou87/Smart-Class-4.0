@@ -1,12 +1,12 @@
 import os, sqlite3, hashlib, hmac, secrets, datetime, time, threading
 from contextlib import contextmanager
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Request, Response, Depends
+from fastapi import FastAPI, HTTPException, Request, Response, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
-import csv, io
+import csv, io, uuid, mimetypes, zipfile, re
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 import psycopg
 from psycopg.rows import dict_row
@@ -18,7 +18,7 @@ SECRET = os.environ.get("SMART_SECRET", "")
 if len(SECRET) < 32:
     raise RuntimeError("Set SMART_SECRET to a random value of at least 32 characters.")
 signer = URLSafeTimedSerializer(SECRET, salt="smart-homeroom-v2")
-app = FastAPI(title="Smart Class API v3", docs_url="/api/docs", openapi_url="/api/openapi.json")
+app = FastAPI(title="Smart Class API v4.1", docs_url="/api/docs", openapi_url="/api/openapi.json")
 # Same-origin UI/API; do not enable wildcard cross-origin credentials.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 if not DATABASE_URL:
@@ -40,7 +40,7 @@ class ConnectionAdapter:
         sql=sql.replace("?", "%s").replace("INSERT OR IGNORE INTO", "INSERT INTO")
         if sql.lstrip().upper().startswith("INSERT INTO") and "ON CONFLICT" not in sql.upper() and ("teacher_classes" in sql or "parent_students" in sql or "notice_reads" in sql):
             sql += " ON CONFLICT DO NOTHING"
-        if "INSERT INTO users(" in sql or "INSERT INTO classes(" in sql or "INSERT INTO notices(" in sql or "INSERT INTO students(" in sql:
+        if "INSERT INTO users(" in sql or "INSERT INTO classes(" in sql or "INSERT INTO notices(" in sql or "INSERT INTO students(" in sql or "INSERT INTO notice_attachments(" in sql:
             sql += " RETURNING id"
             cur=self.conn.execute(sql,args)
             row=cur.fetchone()
@@ -69,8 +69,25 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_notices_class ON notices(class_id)",
             "CREATE TABLE IF NOT EXISTS audit_log(id BIGSERIAL PRIMARY KEY, actor_id BIGINT, action TEXT NOT NULL, subject TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS session_version INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
+            "CREATE TABLE IF NOT EXISTS notice_recipients(notice_id BIGINT NOT NULL REFERENCES notices(id) ON DELETE CASCADE, parent_id BIGINT NOT NULL REFERENCES users(id), PRIMARY KEY(notice_id,parent_id))",
+            "CREATE TABLE IF NOT EXISTS notice_attachments(id BIGSERIAL PRIMARY KEY, notice_id BIGINT NOT NULL REFERENCES notices(id) ON DELETE CASCADE, object_key TEXT UNIQUE NOT NULL, filename TEXT NOT NULL, content_type TEXT NOT NULL, file_size INTEGER NOT NULL CHECK(file_size > 0), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+            "CREATE INDEX IF NOT EXISTS idx_notice_recipients_parent ON notice_recipients(parent_id)",
         ]: c.execute(statement)
 init_db()
+
+def r2_client():
+    import boto3
+    endpoint=os.environ.get("R2_ENDPOINT", "").strip()
+    bucket=os.environ.get("R2_BUCKET", "").strip()
+    key=os.environ.get("R2_ACCESS_KEY_ID", "").strip()
+    secret=os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
+    if not all((endpoint,bucket,key,secret)):
+        raise HTTPException(503,"Chưa cấu hình Cloudflare R2")
+    if not endpoint.startswith("https://") or not re.fullmatch(r"https://[a-fA-F0-9]{32}\.r2\.cloudflarestorage\.com/?",endpoint):
+        raise HTTPException(503,"R2_ENDPOINT không hợp lệ")
+    return boto3.client("s3",endpoint_url=endpoint.rstrip("/"),aws_access_key_id=key,
+                        aws_secret_access_key=secret,region_name="auto"),bucket
 
 def audit(c, actor_id, action, subject=''):
     c.execute("INSERT INTO audit_log(actor_id,action,subject) VALUES(?,?,?)",(actor_id,action,str(subject)[:200]))
@@ -133,7 +150,7 @@ def classes_for(c,u):
         return [r["class_id"] for r in c.execute("SELECT class_id FROM teacher_classes WHERE teacher_id=?",(u["id"],))]
     return [r["class_id"] for r in c.execute("""
         SELECT DISTINCT s.class_id FROM students s JOIN parent_students ps ON ps.student_id=s.id
-        WHERE ps.parent_id=?""",(u["id"],))]
+        WHERE ps.parent_id=? AND s.deleted_at IS NULL""",(u["id"],))]
 def can_class(c,u,class_id):
     if class_id not in classes_for(c,u): raise HTTPException(403,"Không có quyền với lớp này")
 class Login(BaseModel):
@@ -176,9 +193,9 @@ def students(class_id:int,u=Depends(current_user)):
         if u["role"]=="parent":
             rows=c.execute("""SELECT s.id,s.code,s.name,s.class_id FROM students s
             JOIN parent_students ps ON ps.student_id=s.id
-            WHERE s.class_id=? AND ps.parent_id=? ORDER BY s.name""",(class_id,u["id"]))
+            WHERE s.class_id=? AND ps.parent_id=? AND s.deleted_at IS NULL ORDER BY s.name""",(class_id,u["id"]))
         else:
-            rows=c.execute("SELECT id,code,name,class_id FROM students WHERE class_id=? ORDER BY name",(class_id,))
+            rows=c.execute("SELECT id,code,name,class_id FROM students WHERE class_id=? AND deleted_at IS NULL ORDER BY name",(class_id,))
         return [dict(r) for r in rows]
 @app.get("/api/notices")
 def notices(class_id:int,u=Depends(current_user)):
@@ -198,6 +215,13 @@ def create_notice(payload:NoticeIn,request:Request,u=Depends(current_user)):
         can_class(c,u,payload.class_id)
         cur=c.execute("INSERT INTO notices(class_id,author_id,title,body) VALUES(?,?,?,?)",
             (payload.class_id,u["id"],payload.title.strip(),payload.body.strip()))
+        # Freeze the intended audience at publishing time.
+        c.execute("""INSERT INTO notice_recipients(notice_id,parent_id)
+            SELECT DISTINCT %s, ps.parent_id FROM students s
+            JOIN parent_students ps ON ps.student_id=s.id
+            JOIN users u ON u.id=ps.parent_id
+            WHERE s.class_id=%s AND s.deleted_at IS NULL AND u.active=1
+            ON CONFLICT DO NOTHING""",(cur.lastrowid,payload.class_id))
         return {"id":cur.lastrowid}
 @app.post("/api/notices/{notice_id}/read")
 def mark_read(notice_id:int,request:Request,u=Depends(current_user)):
@@ -207,6 +231,8 @@ def mark_read(notice_id:int,request:Request,u=Depends(current_user)):
         n=c.execute("SELECT class_id FROM notices WHERE id=?",(notice_id,)).fetchone()
         if not n:raise HTTPException(404,"Không có thông báo")
         can_class(c,u,n["class_id"])
+        if not c.execute("SELECT 1 FROM notice_recipients WHERE notice_id=? AND parent_id=?",(notice_id,u["id"])).fetchone():
+            raise HTTPException(403,"Không thuộc danh sách nhận thông báo")
         c.execute("INSERT OR IGNORE INTO notice_reads(notice_id,parent_id) VALUES(?,?)",(notice_id,u["id"]))
     return {"ok":True}
 @app.get("/api/notices/{notice_id}/read-count")
@@ -216,7 +242,7 @@ def read_count(notice_id:int,u=Depends(current_user)):
         n=c.execute("SELECT class_id FROM notices WHERE id=?",(notice_id,)).fetchone()
         if not n:raise HTTPException(404,"Không có thông báo")
         can_class(c,u,n["class_id"])
-        count=c.execute("SELECT count(*) AS count FROM notice_reads WHERE notice_id=?",(notice_id,)).fetchone()["count"]
+        count=c.execute("SELECT count(*) AS count FROM notice_reads r JOIN notice_recipients nr ON nr.notice_id=r.notice_id AND nr.parent_id=r.parent_id WHERE r.notice_id=?",(notice_id,)).fetchone()["count"]
     return {"count":count}
 
 # Administrator workflows: demonstration-only, server-side authorization enforced.
@@ -276,6 +302,8 @@ def link_parent(payload:LinkParent,request:Request,u=Depends(current_user)):
         parent=c.execute("SELECT id FROM users WHERE id=? AND role='parent'",(payload.parent_id,)).fetchone()
         student=c.execute("SELECT id FROM students WHERE id=?",(payload.student_id,)).fetchone()
         if not parent or not student:raise HTTPException(400,"Phụ huynh hoặc học sinh không hợp lệ")
+        if c.execute("SELECT deleted_at FROM students WHERE id=?",(payload.student_id,)).fetchone()["deleted_at"] is not None:
+            raise HTTPException(400,"Không thể liên kết học sinh đã xóa")
         c.execute("INSERT OR IGNORE INTO parent_students VALUES(?,?)",(payload.parent_id,payload.student_id))
     return {"ok":True}
 @app.post("/api/admin/import-students")
@@ -346,6 +374,172 @@ def account_status(payload:AccountStatus,request:Request,u=Depends(current_user)
             raise HTTPException(400,"Không thể thay đổi tài khoản này")
         c.execute("UPDATE users SET active=?,session_version=session_version+1 WHERE id=?",(int(payload.active),payload.user_id))
         audit(c,u["id"],"account_status",f"{payload.user_id}:{payload.active}")
+    return {"ok":True}
+
+
+# Smart Class 4.1 - reversible deletion, administrator relationship audit.
+@app.delete("/api/admin/students/{student_id}")
+def delete_student(student_id:int,request:Request,u=Depends(current_user)):
+    csrf(request);admin_only(u)
+    with db() as c:
+        row=c.execute("SELECT id,deleted_at FROM students WHERE id=?",(student_id,)).fetchone()
+        if not row:raise HTTPException(404,"Không tìm thấy học sinh")
+        if row["deleted_at"] is not None:raise HTTPException(409,"Học sinh đã được lưu trữ")
+        c.execute("UPDATE students SET deleted_at=NOW() WHERE id=?",(student_id,))
+        audit(c,u["id"],"archive_student",student_id)
+    return {"ok":True}
+
+@app.post("/api/admin/students/{student_id}/restore")
+def restore_student(student_id:int,request:Request,u=Depends(current_user)):
+    csrf(request);admin_only(u)
+    with db() as c:
+        if not c.execute("SELECT 1 FROM students WHERE id=?",(student_id,)).fetchone():
+            raise HTTPException(404,"Không tìm thấy học sinh")
+        c.execute("UPDATE students SET deleted_at=NULL WHERE id=?",(student_id,))
+        audit(c,u["id"],"restore_student",student_id)
+    return {"ok":True}
+
+@app.get("/api/admin/students")
+def admin_students(class_id:int,u=Depends(current_user)):
+    admin_only(u)
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT id,code,name,class_id,deleted_at FROM students WHERE class_id=? ORDER BY name",(class_id,))]
+
+@app.get("/api/admin/parent-links")
+def parent_links(class_id:int|None=None,u=Depends(current_user)):
+    admin_only(u)
+    with db() as c:
+        sql="""SELECT ps.parent_id,ps.student_id,p.name AS parent_name,p.username AS parent_username,
+            s.name AS student_name,s.code AS student_code,s.class_id,c.name AS class_name,
+            s.deleted_at IS NOT NULL AS student_archived
+            FROM parent_students ps JOIN users p ON p.id=ps.parent_id
+            JOIN students s ON s.id=ps.student_id JOIN classes c ON c.id=s.class_id"""
+        if class_id is not None:sql+=" WHERE s.class_id=%s"
+        sql+=" ORDER BY c.name,s.name,p.name"
+        return [dict(r) for r in c.execute(sql,(class_id,) if class_id is not None else ())]
+
+@app.delete("/api/admin/parent-links/{parent_id}/{student_id}")
+def unlink_parent(parent_id:int,student_id:int,request:Request,u=Depends(current_user)):
+    csrf(request);admin_only(u)
+    with db() as c:
+        c.execute("DELETE FROM parent_students WHERE parent_id=? AND student_id=?",(parent_id,student_id))
+        audit(c,u["id"],"unlink_parent",f"{parent_id}:{student_id}")
+    return {"ok":True}
+
+@app.get("/api/notices/{notice_id}/read-status")
+def read_status(notice_id:int,u=Depends(current_user)):
+    if u["role"]=="parent":raise HTTPException(403,"Không có quyền")
+    with db() as c:
+        n=c.execute("SELECT class_id FROM notices WHERE id=?",(notice_id,)).fetchone()
+        if not n:raise HTTPException(404,"Không tìm thấy thông báo")
+        can_class(c,u,n["class_id"])
+        rows=c.execute("""SELECT p.id,p.name,p.username,r.read_at,
+            STRING_AGG(DISTINCT s.name, ', ' ORDER BY s.name) AS student_names
+            FROM notice_recipients nr JOIN users p ON p.id=nr.parent_id
+            LEFT JOIN notice_reads r ON r.notice_id=nr.notice_id AND r.parent_id=nr.parent_id
+            LEFT JOIN parent_students ps ON ps.parent_id=p.id
+            LEFT JOIN students s ON s.id=ps.student_id AND s.class_id=%s
+            WHERE nr.notice_id=%s GROUP BY p.id,p.name,p.username,r.read_at
+            ORDER BY r.read_at NULLS FIRST,p.name""",(n["class_id"],notice_id))
+        result=[dict(r) for r in rows]
+        return {"total":len(result),"read":sum(r["read_at"] is not None for r in result),"parents":result}
+
+# R2 bucket stays private; all upload/download requests are authorized by the API.
+ALLOWED_EXT={".jpg":"image/jpeg",".jpeg":"image/jpeg",".png":"image/png",
+             ".pdf":"application/pdf",
+             ".docx":"application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
+MAX_FILE=8*1024*1024
+
+def valid_upload(filename,data):
+    ext=Path(filename).suffix.lower()
+    if ext not in ALLOWED_EXT:raise HTTPException(400,"Chỉ hỗ trợ JPG, PNG, PDF, DOCX")
+    if not data or len(data)>MAX_FILE:raise HTTPException(413,"Tệp phải có dung lượng từ 1 byte đến 8 MB")
+    ok={".jpg":lambda d:d.startswith(b"\xff\xd8\xff"),
+        ".jpeg":lambda d:d.startswith(b"\xff\xd8\xff"),
+        ".png":lambda d:d.startswith(b"\x89PNG\r\n\x1a\n"),
+        ".pdf":lambda d:d.startswith(b"%PDF-"),
+        ".docx":lambda d:zipfile.is_zipfile(io.BytesIO(d)) and
+            "[Content_Types].xml" in zipfile.ZipFile(io.BytesIO(d)).namelist() and
+            "word/document.xml" in zipfile.ZipFile(io.BytesIO(d)).namelist()}[ext](data)
+    if not ok:raise HTTPException(400,"Nội dung tệp không đúng định dạng")
+    return ALLOWED_EXT[ext]
+
+@app.post("/api/notices/{notice_id}/attachments",status_code=201)
+async def upload_attachment(notice_id:int,request:Request,file:UploadFile=File(...),u=Depends(current_user)):
+    csrf(request)
+    if u["role"] not in ("admin","teacher"):raise HTTPException(403,"Không có quyền")
+    with db() as c:
+        n=c.execute("SELECT class_id FROM notices WHERE id=?",(notice_id,)).fetchone()
+        if not n:raise HTTPException(404,"Không tìm thấy thông báo")
+        can_class(c,u,n["class_id"])
+        if c.execute("SELECT COUNT(*) AS n FROM notice_attachments WHERE notice_id=?",(notice_id,)).fetchone()["n"]>=5:
+            raise HTTPException(400,"Tối đa 5 tệp mỗi thông báo")
+    filename=Path((file.filename or "").replace("\\","/")).name
+    if not filename or len(filename)>180:raise HTTPException(400,"Tên tệp không hợp lệ")
+    data=await file.read(MAX_FILE+1)
+    content_type=valid_upload(filename,data)
+    client,bucket=r2_client()
+    key=f"smart-class/notices/{notice_id}/{uuid.uuid4().hex}{Path(filename).suffix.lower()}"
+    from botocore.exceptions import BotoCoreError,ClientError
+    try:
+        client.put_object(Bucket=bucket,Key=key,Body=data,ContentType=content_type)
+    except (BotoCoreError,ClientError):raise HTTPException(502,"Không tải được tệp lên R2")
+    try:
+        with db() as c:
+            cur=c.execute("INSERT INTO notice_attachments(notice_id,object_key,filename,content_type,file_size) VALUES(?,?,?,?,?)",
+                          (notice_id,key,filename,content_type,len(data)))
+            audit(c,u["id"],"upload_attachment",cur.lastrowid)
+            return {"id":cur.lastrowid,"filename":filename}
+    except Exception:
+        try:client.delete_object(Bucket=bucket,Key=key)
+        except Exception:pass
+        raise
+
+@app.get("/api/notices/{notice_id}/attachments")
+def list_attachments(notice_id:int,u=Depends(current_user)):
+    with db() as c:
+        n=c.execute("SELECT class_id FROM notices WHERE id=?",(notice_id,)).fetchone()
+        if not n:raise HTTPException(404,"Không tìm thấy thông báo")
+        can_class(c,u,n["class_id"])
+        if u["role"]=="parent" and not c.execute("SELECT 1 FROM notice_recipients WHERE notice_id=? AND parent_id=?",(notice_id,u["id"])).fetchone():
+            raise HTTPException(403,"Không thuộc danh sách nhận thông báo")
+        return [dict(r) for r in c.execute("SELECT id,filename,file_size,content_type FROM notice_attachments WHERE notice_id=? ORDER BY id",(notice_id,))]
+
+@app.get("/api/attachments/{attachment_id}/download")
+def download_attachment(attachment_id:int,u=Depends(current_user)):
+    with db() as c:
+        row=c.execute("""SELECT a.*,n.class_id,n.id AS notice_id FROM notice_attachments a
+            JOIN notices n ON n.id=a.notice_id WHERE a.id=?""",(attachment_id,)).fetchone()
+        if not row:raise HTTPException(404,"Không tìm thấy tệp")
+        can_class(c,u,row["class_id"])
+        if u["role"]=="parent" and not c.execute("SELECT 1 FROM notice_recipients WHERE notice_id=? AND parent_id=?",(row["notice_id"],u["id"])).fetchone():
+            raise HTTPException(403,"Không có quyền tải tệp")
+    client,bucket=r2_client()
+    from botocore.exceptions import BotoCoreError,ClientError
+    try:obj=client.get_object(Bucket=bucket,Key=row["object_key"])
+    except (BotoCoreError,ClientError):raise HTTPException(502,"Không đọc được tệp từ R2")
+    from urllib.parse import quote
+    filename=row["filename"].replace('"','').replace('\r','').replace('\n','')
+    return StreamingResponse(obj["Body"].iter_chunks(chunk_size=65536),media_type="application/octet-stream",
+        headers={"Content-Disposition":f"attachment; filename*=UTF-8''{quote(filename)}",
+                 "Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff"})
+
+@app.delete("/api/attachments/{attachment_id}")
+def delete_attachment(attachment_id:int,request:Request,u=Depends(current_user)):
+    csrf(request)
+    if u["role"] not in ("admin","teacher"):raise HTTPException(403,"Không có quyền")
+    with db() as c:
+        row=c.execute("""SELECT a.object_key,n.class_id FROM notice_attachments a
+            JOIN notices n ON n.id=a.notice_id WHERE a.id=?""",(attachment_id,)).fetchone()
+        if not row:raise HTTPException(404,"Không tìm thấy tệp")
+        can_class(c,u,row["class_id"])
+    client,bucket=r2_client()
+    from botocore.exceptions import BotoCoreError,ClientError
+    try:client.delete_object(Bucket=bucket,Key=row["object_key"])
+    except (BotoCoreError,ClientError):raise HTTPException(502,"Không thể xóa tệp trên R2")
+    with db() as c:
+        c.execute("DELETE FROM notice_attachments WHERE id=?",(attachment_id,))
+        audit(c,u["id"],"delete_attachment",attachment_id)
     return {"ok":True}
 
 @app.get("/api/health")
