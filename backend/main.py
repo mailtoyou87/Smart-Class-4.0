@@ -1,4 +1,4 @@
-import os, sqlite3, hashlib, hmac, secrets, datetime, time, threading
+import os, sqlite3, hashlib, hmac, secrets, datetime, time, threading, json, logging
 from contextlib import contextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, Response, Depends, UploadFile, File, Form
@@ -18,7 +18,7 @@ SECRET = os.environ.get("SMART_SECRET", "")
 if len(SECRET) < 32:
     raise RuntimeError("Set SMART_SECRET to a random value of at least 32 characters.")
 signer = URLSafeTimedSerializer(SECRET, salt="smart-homeroom-v2")
-app = FastAPI(title="Smart Class API v4.1", docs_url="/api/docs", openapi_url="/api/openapi.json")
+app = FastAPI(title="Smart Class API v4.2", docs_url="/api/docs", openapi_url="/api/openapi.json")
 # Same-origin UI/API; do not enable wildcard cross-origin credentials.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 if not DATABASE_URL:
@@ -73,6 +73,10 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS notice_recipients(notice_id BIGINT NOT NULL REFERENCES notices(id) ON DELETE CASCADE, parent_id BIGINT NOT NULL REFERENCES users(id), PRIMARY KEY(notice_id,parent_id))",
             "CREATE TABLE IF NOT EXISTS notice_attachments(id BIGSERIAL PRIMARY KEY, notice_id BIGINT NOT NULL REFERENCES notices(id) ON DELETE CASCADE, object_key TEXT UNIQUE NOT NULL, filename TEXT NOT NULL, content_type TEXT NOT NULL, file_size INTEGER NOT NULL CHECK(file_size > 0), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
             "CREATE INDEX IF NOT EXISTS idx_notice_recipients_parent ON notice_recipients(parent_id)",
+            "CREATE TABLE IF NOT EXISTS push_subscriptions(id BIGSERIAL PRIMARY KEY,parent_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,endpoint TEXT UNIQUE NOT NULL,subscription_json TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+            "CREATE INDEX IF NOT EXISTS idx_push_parent ON push_subscriptions(parent_id)",
+            "CREATE TABLE IF NOT EXISTS notice_reminders(notice_id BIGINT NOT NULL REFERENCES notices(id) ON DELETE CASCADE,parent_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(notice_id,parent_id))",
+            "CREATE TABLE IF NOT EXISTS push_events(id BIGSERIAL PRIMARY KEY,notice_id BIGINT REFERENCES notices(id) ON DELETE SET NULL,parent_id BIGINT REFERENCES users(id) ON DELETE SET NULL,kind TEXT NOT NULL,status TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
         ]: c.execute(statement)
 init_db()
 
@@ -222,7 +226,10 @@ def create_notice(payload:NoticeIn,request:Request,u=Depends(current_user)):
             JOIN users u ON u.id=ps.parent_id
             WHERE s.class_id=%s AND s.deleted_at IS NULL AND u.active=1
             ON CONFLICT DO NOTHING""",(cur.lastrowid,payload.class_id))
-        return {"id":cur.lastrowid}
+        notice_id=cur.lastrowid
+    # The notice is committed before any external push requests.
+    send_push_for_notice(notice_id, kind="new")
+    return {"id":notice_id}
 @app.post("/api/notices/{notice_id}/read")
 def mark_read(notice_id:int,request:Request,u=Depends(current_user)):
     csrf(request)
@@ -540,6 +547,160 @@ def delete_attachment(attachment_id:int,request:Request,u=Depends(current_user))
     with db() as c:
         c.execute("DELETE FROM notice_attachments WHERE id=?",(attachment_id,))
         audit(c,u["id"],"delete_attachment",attachment_id)
+    return {"ok":True}
+
+
+# Smart Class 4.2 — Web Push (only subscribed parent devices)
+log=logging.getLogger("smartclass.push")
+def vapid_ready():
+    return bool(os.getenv("VAPID_PUBLIC_KEY") and os.getenv("VAPID_PRIVATE_KEY") and os.getenv("VAPID_SUBJECT"))
+
+def push_one(subscription, title, body, url):
+    from pywebpush import webpush, WebPushException
+    try:
+        webpush(subscription_info=json.loads(subscription["subscription_json"]),
+                data=json.dumps({"title":title,"body":body,"url":url},ensure_ascii=False),
+                vapid_private_key=os.environ["VAPID_PRIVATE_KEY"],
+                vapid_claims={"sub":os.environ["VAPID_SUBJECT"]},ttl=86400,timeout=8)
+        return "sent"
+    except WebPushException as exc:
+        status=getattr(getattr(exc,"response",None),"status_code",None)
+        if status in (404,410):
+            with db() as c: c.execute("DELETE FROM push_subscriptions WHERE id=?",(subscription["id"],))
+            return "expired"
+        log.warning("Push delivery failed: status=%s",status)
+        return "failed"
+    except Exception:
+        log.exception("Push delivery failed")
+        return "failed"
+
+def send_push_for_notice(notice_id,kind="new",parent_ids=None):
+    if not vapid_ready():
+        log.warning("Web Push not configured: set VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT")
+        return {"sent":0,"failed":0,"not_configured":True}
+    with db() as c:
+        n=c.execute("SELECT id,title,class_id FROM notices WHERE id=?",(notice_id,)).fetchone()
+        if not n:return {"sent":0,"failed":0}
+        sql="""SELECT ps.id,ps.parent_id,ps.subscription_json FROM push_subscriptions ps
+            JOIN notice_recipients nr ON nr.parent_id=ps.parent_id
+            JOIN users u ON u.id=ps.parent_id AND u.active=1
+            WHERE nr.notice_id=?"""
+        args=[notice_id]
+        if kind=="reminder":
+            sql+=" AND NOT EXISTS (SELECT 1 FROM notice_reads r WHERE r.notice_id=nr.notice_id AND r.parent_id=nr.parent_id)"
+        if parent_ids is not None:
+            if not parent_ids:return {"sent":0,"failed":0}
+            sql+=" AND ps.parent_id=ANY(%s)";args.append(parent_ids)
+        subscriptions=list(c.execute(sql,tuple(args)))
+    counts={"sent":0,"failed":0,"expired":0}
+    for sub in subscriptions:
+        status=push_one(sub,"Smart Class — Nhắc xem thông báo" if kind=="reminder" else "Smart Class — Thông báo mới",
+                        "Quý phụ huynh có thông báo cần xem." if kind=="reminder" else n["title"],
+                        "/?notice="+str(notice_id))
+        counts[status]+=1
+        with db() as c:
+            c.execute("INSERT INTO push_events(notice_id,parent_id,kind,status) VALUES(?,?,?,?)",(notice_id,sub["parent_id"],kind,status))
+    return counts
+
+class PushSubscription(BaseModel):
+    endpoint:str=Field(min_length=10,max_length=2048)
+    keys:dict
+    expirationTime:float|None=None
+
+@app.get("/api/push/public-key")
+def push_public_key(u=Depends(current_user)):
+    return {"enabled":vapid_ready(),"public_key":os.getenv("VAPID_PUBLIC_KEY","") if vapid_ready() else ""}
+
+@app.post("/api/push/subscribe")
+def push_subscribe(payload:PushSubscription,request:Request,u=Depends(current_user)):
+    csrf(request)
+    if u["role"]!="parent":raise HTTPException(403,"Chỉ phụ huynh đăng ký nhận thông báo")
+    if not vapid_ready():raise HTTPException(503,"Chưa cấu hình Web Push")
+    if not payload.endpoint.startswith("https://") or not isinstance(payload.keys.get("p256dh"),str) or not isinstance(payload.keys.get("auth"),str):
+        raise HTTPException(400,"Đăng ký thiết bị không hợp lệ")
+    obj=payload.model_dump(exclude_none=True)
+    with db() as c:
+        c.execute("""INSERT INTO push_subscriptions(parent_id,endpoint,subscription_json) VALUES(%s,%s,%s)
+            ON CONFLICT(endpoint) DO UPDATE SET parent_id=EXCLUDED.parent_id,subscription_json=EXCLUDED.subscription_json""",
+            (u["id"],payload.endpoint,json.dumps(obj)))
+    return {"ok":True}
+
+@app.post("/api/push/unsubscribe")
+def push_unsubscribe(payload:PushSubscription,request:Request,u=Depends(current_user)):
+    csrf(request)
+    with db() as c:c.execute("DELETE FROM push_subscriptions WHERE endpoint=? AND parent_id=?",(payload.endpoint,u["id"]))
+    return {"ok":True}
+
+class ReminderIn(BaseModel):
+    parent_ids:list[int]|None=None
+
+@app.post("/api/notices/{notice_id}/remind")
+def remind_unread(notice_id:int,payload:ReminderIn,request:Request,u=Depends(current_user)):
+    csrf(request)
+    if u["role"] not in ("admin","teacher"):raise HTTPException(403,"Không có quyền")
+    with db() as c:
+        n=c.execute("SELECT class_id FROM notices WHERE id=?",(notice_id,)).fetchone()
+        if not n:raise HTTPException(404,"Không tìm thấy thông báo")
+        can_class(c,u,n["class_id"])
+        sql="""SELECT nr.parent_id FROM notice_recipients nr JOIN users us ON us.id=nr.parent_id AND us.active=1
+          WHERE nr.notice_id=? AND NOT EXISTS(SELECT 1 FROM notice_reads r WHERE r.notice_id=nr.notice_id AND r.parent_id=nr.parent_id)
+          AND NOT EXISTS(SELECT 1 FROM notice_reminders m WHERE m.notice_id=nr.notice_id AND m.parent_id=nr.parent_id AND m.sent_at>NOW()-INTERVAL '24 hours')"""
+        args=[notice_id]
+        if payload.parent_ids is not None:
+            if not payload.parent_ids:return {"eligible":0,"sent":0}
+            sql+=" AND nr.parent_id=ANY(%s)";args.append(payload.parent_ids)
+        eligible=[r["parent_id"] for r in c.execute(sql,tuple(args))]
+    if not vapid_ready():raise HTTPException(503,"Chưa cấu hình Web Push")
+    if not eligible:return {"eligible":0,"sent":0}
+    result=send_push_for_notice(notice_id,"reminder",eligible)
+    # Count reminders only for users with a successful push, not those without subscriptions.
+    with db() as c:
+        sent_ids=[r["parent_id"] for r in c.execute("""SELECT DISTINCT parent_id FROM push_events WHERE notice_id=? AND kind='reminder' AND status='sent' AND created_at>NOW()-INTERVAL '2 minutes' AND parent_id=ANY(%s)""",(notice_id,eligible))]
+        for pid in sent_ids:
+            c.execute("""INSERT INTO notice_reminders(notice_id,parent_id,sent_at) VALUES(%s,%s,NOW())
+                ON CONFLICT(notice_id,parent_id) DO UPDATE SET sent_at=EXCLUDED.sent_at""",(notice_id,pid))
+        audit(c,u["id"],"remind_unread",f"notice:{notice_id};sent:{len(sent_ids)}")
+    return {"eligible":len(eligible),"parents_notified":len(sent_ids),**result}
+
+class DeleteConfirmation(BaseModel):
+    confirm:str
+
+def require_delete_confirmation(confirm,expected):
+    if confirm!=expected:raise HTTPException(400,"Xác nhận xóa không khớp")
+
+@app.post("/api/admin/students/{student_id}/purge")
+def purge_student(student_id:int,payload:DeleteConfirmation,request:Request,u=Depends(current_user)):
+    csrf(request);admin_only(u)
+    with db() as c:
+        row=c.execute("SELECT id,code FROM students WHERE id=?",(student_id,)).fetchone()
+        if not row:raise HTTPException(404,"Không tìm thấy học sinh")
+        require_delete_confirmation(payload.confirm,row["code"])
+        c.execute("DELETE FROM parent_students WHERE student_id=?",(student_id,))
+        c.execute("DELETE FROM students WHERE id=?",(student_id,))
+        audit(c,u["id"],"purge_student",student_id)
+    return {"ok":True}
+
+@app.post("/api/admin/users/{user_id}/purge")
+def purge_user(user_id:int,payload:DeleteConfirmation,request:Request,u=Depends(current_user)):
+    csrf(request);admin_only(u)
+    with db() as c:
+        target=c.execute("SELECT id,username,role FROM users WHERE id=?",(user_id,)).fetchone()
+        if not target:raise HTTPException(404,"Không tìm thấy tài khoản")
+        if target["role"]=="admin":raise HTTPException(403,"Không được xóa tài khoản quản trị")
+        require_delete_confirmation(payload.confirm,target["username"])
+        if target["role"]=="teacher":
+            # Historical notices remain attributed to the original author.
+            if c.execute("SELECT 1 FROM notices WHERE author_id=? LIMIT 1",(user_id,)).fetchone():
+                raise HTTPException(409,"Giáo viên có thông báo lịch sử: không thể xóa vĩnh viễn; hãy khóa tài khoản")
+            if c.execute("SELECT 1 FROM teacher_classes WHERE teacher_id=? LIMIT 1",(user_id,)).fetchone():
+                raise HTTPException(409,"Cần hủy phân công lớp trước khi xóa giáo viên")
+        if target["role"]=="parent":
+            if c.execute("SELECT 1 FROM notice_reads WHERE parent_id=? LIMIT 1",(user_id,)).fetchone() or c.execute("SELECT 1 FROM notice_recipients WHERE parent_id=? LIMIT 1",(user_id,)).fetchone():
+                raise HTTPException(409,"Phụ huynh có lịch sử thông báo: không thể xóa vĩnh viễn mà không mất dấu vết; hãy khóa tài khoản")
+            c.execute("DELETE FROM parent_students WHERE parent_id=?",(user_id,))
+        c.execute("DELETE FROM push_subscriptions WHERE parent_id=?",(user_id,))
+        c.execute("DELETE FROM users WHERE id=?",(user_id,))
+        audit(c,u["id"],"purge_user",user_id)
     return {"ok":True}
 
 @app.get("/api/health")
