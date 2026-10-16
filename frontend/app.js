@@ -2,7 +2,7 @@ let user=null,classes=[],selected=null;
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function api(path,opts={}){
-  const r=await fetch('/api'+path,{credentials:'same-origin',...opts,headers:{'X-Smart-Request':'1','Content-Type':'application/json',...(opts.headers||{})}});
+  const r=await fetch('/api'+path,{credentials:'same-origin',cache:'no-store',...opts,headers:{'X-Smart-Request':'1','Content-Type':'application/json',...(opts.headers||{})}});
   if(!r.ok){let data=await r.json().catch(()=>({}));throw Error(data.detail||'Lỗi kết nối')}
   return r.json();
 }
@@ -108,6 +108,33 @@ async function adminView(){
  $('#manageClass').onchange=()=>renderStudents().catch(error);$('#linksClass').onchange=()=>renderLinks().catch(error);
  if(allClasses.length)await renderStudents();await renderLinks();
 }
+
+// Làm mới dữ liệu tại chỗ, giữ phiên đăng nhập và lớp đang chọn.
+let bannerRefreshing=false;
+async function refreshSmartClass(){
+ if(bannerRefreshing)return;
+ const banner=$('#smartBanner'),hint=$('#refreshHint');
+ bannerRefreshing=true;
+ banner.setAttribute('aria-busy','true');
+ hint.textContent='⏳ Đang cập nhật dữ liệu...';
+ try{
+   // Xác minh phiên còn hiệu lực, tránh tự động đăng xuất khi chỉ làm mới.
+   const currentUser=await api('/me');
+   user=currentUser;
+   if(user.role==='admin' && !selected) await adminView();
+   else await load();
+   hint.textContent='✓ Đã cập nhật dữ liệu mới nhất';
+ }catch(err){
+   hint.textContent='⚠ Không thể cập nhật. Chạm để thử lại.';
+   console.warn('Smart Class refresh failed:',err);
+ }finally{
+   bannerRefreshing=false;
+   banner.removeAttribute('aria-busy');
+ }
+}
+const smartBanner=$('#smartBanner');
+smartBanner.addEventListener('click',refreshSmartClass);
+smartBanner.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();refreshSmartClass()}});
 
 api('/me').then(u=>{user=u;return load()}).catch(()=>loginView());
 
