@@ -18,7 +18,7 @@ SECRET = os.environ.get("SMART_SECRET", "")
 if len(SECRET) < 32:
     raise RuntimeError("Set SMART_SECRET to a random value of at least 32 characters.")
 signer = URLSafeTimedSerializer(SECRET, salt="smart-homeroom-v2")
-app = FastAPI(title="Smart Class API v4.2", docs_url="/api/docs", openapi_url="/api/openapi.json")
+app = FastAPI(title="Smart Class API v4.4", docs_url="/api/docs", openapi_url="/api/openapi.json")
 # Same-origin UI/API; do not enable wildcard cross-origin credentials.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 if not DATABASE_URL:
@@ -80,6 +80,11 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_push_parent ON push_subscriptions(parent_id)",
             "CREATE TABLE IF NOT EXISTS notice_reminders(notice_id BIGINT NOT NULL REFERENCES notices(id) ON DELETE CASCADE,parent_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(notice_id,parent_id))",
             "CREATE TABLE IF NOT EXISTS push_events(id BIGSERIAL PRIMARY KEY,notice_id BIGINT REFERENCES notices(id) ON DELETE SET NULL,parent_id BIGINT REFERENCES users(id) ON DELETE SET NULL,kind TEXT NOT NULL,status TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+            "CREATE TABLE IF NOT EXISTS notice_replies(id BIGSERIAL PRIMARY KEY,notice_id BIGINT NOT NULL REFERENCES notices(id) ON DELETE CASCADE,parent_id BIGINT NOT NULL REFERENCES users(id),sender_id BIGINT NOT NULL REFERENCES users(id),body TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+            "CREATE INDEX IF NOT EXISTS idx_notice_replies_notice_parent ON notice_replies(notice_id,parent_id,created_at)",
+            "CREATE TABLE IF NOT EXISTS absence_requests(id BIGSERIAL PRIMARY KEY,student_id BIGINT NOT NULL REFERENCES students(id),class_id BIGINT NOT NULL REFERENCES classes(id),parent_id BIGINT NOT NULL REFERENCES users(id),absence_date DATE NOT NULL,session TEXT NOT NULL CHECK(session IN ('morning','afternoon','full')),reason TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','needs_info','rejected')),teacher_note TEXT NOT NULL DEFAULT '',reviewer_id BIGINT REFERENCES users(id),reviewed_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+            "CREATE INDEX IF NOT EXISTS idx_absence_class_date ON absence_requests(class_id,absence_date DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_absence_parent ON absence_requests(parent_id,created_at DESC)",
         ]: c.execute(statement)
 init_db()
 
@@ -726,6 +731,8 @@ def purge_user(user_id:int,payload:DeleteConfirmation,request:Request,u=Depends(
         if not target:raise HTTPException(404,"Không tìm thấy tài khoản")
         if target["role"]=="admin":raise HTTPException(403,"Không được xóa tài khoản quản trị")
         require_delete_confirmation(payload.confirm,target["username"])
+        if c.execute("SELECT 1 FROM notice_replies WHERE sender_id=? LIMIT 1",(user_id,)).fetchone() or c.execute("SELECT 1 FROM absence_requests WHERE reviewer_id=? OR parent_id=? LIMIT 1",(user_id,user_id)).fetchone():
+            raise HTTPException(409,"Tài khoản có lịch sử phản hồi/đơn nghỉ học; hãy khóa thay vì xóa vĩnh viễn")
         if target["role"]=="teacher":
             # Historical notices remain attributed to the original author.
             if c.execute("SELECT 1 FROM notices WHERE author_id=? LIMIT 1",(user_id,)).fetchone():
@@ -740,6 +747,121 @@ def purge_user(user_id:int,payload:DeleteConfirmation,request:Request,u=Depends(
         c.execute("DELETE FROM users WHERE id=?",(user_id,))
         audit(c,u["id"],"purge_user",user_id)
     return {"ok":True}
+
+# Smart Class 4.4: parent feedback and electronic absence requests.
+class ReplyIn(BaseModel):
+    body:str=Field(min_length=1,max_length=2000)
+    parent_id:int|None=None
+
+
+def reply_access(c,u,notice_id,parent_id=None):
+    n=c.execute("SELECT id,class_id,deleted_at FROM notices WHERE id=?",(notice_id,)).fetchone()
+    if not n or n['deleted_at'] is not None:raise HTTPException(404,"Thông báo không tồn tại")
+    if u['role']=='parent':
+        if parent_id is not None and parent_id!=u['id']:raise HTTPException(403,"Không có quyền xem phản hồi")
+        if not c.execute("SELECT 1 FROM notice_recipients WHERE notice_id=? AND parent_id=?",(notice_id,u['id'])).fetchone():
+            raise HTTPException(403,"Không thuộc danh sách nhận thông báo")
+        return u['id']
+    can_class(c,u,n['class_id'])
+    if parent_id is None:raise HTTPException(400,"Cần chọn phụ huynh")
+    if not c.execute("SELECT 1 FROM notice_recipients WHERE notice_id=? AND parent_id=?",(notice_id,parent_id)).fetchone():
+        raise HTTPException(403,"Phụ huynh không thuộc danh sách nhận thông báo")
+    return parent_id
+
+@app.get('/api/replies/inbox')
+def reply_inbox(class_id:int,u=Depends(current_user)):
+    if u['role']=='parent':raise HTTPException(403,"Chỉ giáo viên và quản trị viên")
+    with db() as c:
+        can_class(c,u,class_id)
+        rows=c.execute("""SELECT r.notice_id,r.parent_id,n.title,p.name AS parent_name,
+            MAX(r.created_at) AS last_reply_at,COUNT(*) AS messages
+            FROM notice_replies r JOIN notices n ON n.id=r.notice_id
+            JOIN users p ON p.id=r.parent_id WHERE n.class_id=? AND n.deleted_at IS NULL
+            GROUP BY r.notice_id,r.parent_id,n.title,p.name ORDER BY last_reply_at DESC LIMIT 100""",(class_id,)).fetchall()
+        return [dict(x) for x in rows]
+
+@app.get('/api/notices/{notice_id}/replies')
+def get_replies(notice_id:int,parent_id:int|None=None,u=Depends(current_user)):
+    with db() as c:
+        pid=reply_access(c,u,notice_id,parent_id)
+        rows=c.execute("""SELECT r.id,r.body,r.created_at,r.sender_id,s.name AS sender_name
+            FROM notice_replies r JOIN users s ON s.id=r.sender_id
+            WHERE r.notice_id=? AND r.parent_id=? ORDER BY r.id LIMIT 200""",(notice_id,pid)).fetchall()
+        return [dict(x) for x in rows]
+
+@app.post('/api/notices/{notice_id}/replies',status_code=201)
+def post_reply(notice_id:int,payload:ReplyIn,request:Request,u=Depends(current_user)):
+    csrf(request)
+    body=payload.body.strip()
+    if not body:raise HTTPException(422,"Nội dung không được để trống")
+    with db() as c:
+        pid=reply_access(c,u,notice_id,payload.parent_id)
+        # Prevent a single user from flooding a conversation.
+        recent=c.execute("""SELECT COUNT(*) AS n FROM notice_replies WHERE notice_id=? AND sender_id=?
+            AND created_at > NOW()-INTERVAL '1 minute'""",(notice_id,u['id'])).fetchone()['n']
+        if recent>=5:raise HTTPException(429,"Vui lòng đợi trước khi gửi thêm phản hồi")
+        row=c.execute("INSERT INTO notice_replies(notice_id,parent_id,sender_id,body) VALUES(?,?,?,?) RETURNING id",(notice_id,pid,u['id'],body)).fetchone()
+        audit(c,u['id'],'notice_reply',f'notice:{notice_id};parent:{pid}')
+        return {'id':row['id'],'ok':True}
+
+class AbsenceIn(BaseModel):
+    student_id:int
+    absence_date:datetime.date
+    session:str
+    reason:str=Field(min_length=1,max_length=1000)
+
+@app.post('/api/absence-requests',status_code=201)
+def create_absence(payload:AbsenceIn,request:Request,u=Depends(current_user)):
+    csrf(request)
+    if u['role']!='parent':raise HTTPException(403,"Chỉ phụ huynh được gửi đơn")
+    if payload.session not in ('morning','afternoon','full'):raise HTTPException(422,"Buổi học không hợp lệ")
+    reason=payload.reason.strip()
+    if not reason:raise HTTPException(422,"Vui lòng nhập lý do")
+    if payload.absence_date<datetime.date.today()-datetime.timedelta(days=30) or payload.absence_date>datetime.date.today()+datetime.timedelta(days=180):
+        raise HTTPException(422,"Ngày nghỉ nằm ngoài phạm vi cho phép")
+    with db() as c:
+        student=c.execute("""SELECT s.id,s.class_id FROM students s JOIN parent_students ps ON ps.student_id=s.id
+            WHERE s.id=? AND ps.parent_id=? AND s.deleted_at IS NULL""",(payload.student_id,u['id'])).fetchone()
+        if not student:raise HTTPException(403,"Học sinh không liên kết với tài khoản")
+        existing=c.execute("""SELECT id FROM absence_requests WHERE student_id=? AND absence_date=? AND session=?
+            AND status IN ('pending','approved','needs_info') LIMIT 1""",(payload.student_id,payload.absence_date,payload.session)).fetchone()
+        if existing:raise HTTPException(409,"Đã có đơn cho ngày và buổi học này")
+        row=c.execute("""INSERT INTO absence_requests(student_id,class_id,parent_id,absence_date,session,reason)
+            VALUES(?,?,?,?,?,?) RETURNING id""",(payload.student_id,student['class_id'],u['id'],payload.absence_date,payload.session,reason)).fetchone()
+        audit(c,u['id'],'absence_created',row['id'])
+        return {'id':row['id'],'status':'pending'}
+
+@app.get('/api/absence-requests')
+def list_absences(class_id:int,u=Depends(current_user)):
+    with db() as c:
+        can_class(c,u,class_id)
+        sql="""SELECT a.id,a.student_id,a.absence_date,a.session,a.reason,a.status,a.teacher_note,
+            a.created_at,a.reviewed_at,s.name AS student_name,p.name AS parent_name
+            FROM absence_requests a JOIN students s ON s.id=a.student_id JOIN users p ON p.id=a.parent_id
+            WHERE a.class_id=?"""
+        args=[class_id]
+        if u['role']=='parent':sql+=' AND a.parent_id=?';args.append(u['id'])
+        sql+=' ORDER BY a.created_at DESC,a.id DESC LIMIT 200'
+        return [dict(x) for x in c.execute(sql,tuple(args))]
+
+class AbsenceReview(BaseModel):
+    status:str
+    teacher_note:str=Field(default='',max_length=1000)
+
+@app.post('/api/absence-requests/{request_id}/review')
+def review_absence(request_id:int,payload:AbsenceReview,request:Request,u=Depends(current_user)):
+    csrf(request)
+    if u['role'] not in ('teacher','admin'):raise HTTPException(403,"Chỉ giáo viên và quản trị viên")
+    if payload.status not in ('approved','needs_info','rejected'):raise HTTPException(422,"Trạng thái không hợp lệ")
+    with db() as c:
+        row=c.execute("SELECT class_id,status FROM absence_requests WHERE id=? FOR UPDATE",(request_id,)).fetchone()
+        if not row:raise HTTPException(404,"Không tìm thấy đơn")
+        can_class(c,u,row['class_id'])
+        if row['status']!='pending':raise HTTPException(409,"Đơn đã được xử lý")
+        c.execute("""UPDATE absence_requests SET status=?,teacher_note=?,reviewer_id=?,reviewed_at=NOW() WHERE id=?""",
+                  (payload.status,payload.teacher_note.strip(),u['id'],request_id))
+        audit(c,u['id'],'absence_review',f'{request_id}:{payload.status}')
+        return {'ok':True,'status':payload.status}
 
 @app.get("/api/health")
 def health():

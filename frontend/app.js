@@ -32,7 +32,18 @@ async function load(){
   ${user.role==='parent'?`<div class="card"><h2>🔔 Thông báo điện thoại</h2><p class="muted">Cài Smart Class vào màn hình chính và cho phép thông báo để nhận tin mới.</p><button id="enablePush">Bật thông báo</button> <button id="disablePush" class="secondary">Tắt thông báo</button><p id="pushStatus" class="muted"></p></div>`:''}
   <div class="card"><h2>Học sinh ${user.role==='parent'?'của gia đình':'trong lớp'}</h2>${students.length?`<table><thead><tr><th>Mã</th><th>Họ tên</th></tr></thead><tbody>${students.map(s=>`<tr><td>${esc(s.code)}</td><td>${esc(s.name)}</td></tr>`).join('')}</tbody></table>`:'Chưa có dữ liệu'}</div>
   ${user.role==='parent'?'':`<div class="card"><h2>Đăng thông báo cho lớp</h2><form id="noticeForm"><label>Tiêu đề<input name="title" maxlength="120" required></label><label>Nội dung<textarea name="body" maxlength="3000" required></textarea></label><label>Người nhận<select name="audience" id="noticeAudience"><option value="class">Toàn bộ phụ huynh trong lớp</option><option value="selected">Riêng phụ huynh của học sinh được chọn</option></select></label><div id="studentTargetBox" hidden><label>Chọn học sinh (giữ Ctrl trên máy tính để chọn nhiều)<select id="noticeTargets" multiple size="5">${students.map(s=>`<option value="${s.id}">${esc(s.code)} — ${esc(s.name)}</option>`).join('')}</select></label><p class="muted">Chỉ phụ huynh liên kết với học sinh được chọn mới xem được nội dung.</p></div><label>Đính kèm (tối đa 5 tệp JPG/PNG/PDF/DOCX, mỗi tệp ≤8 MB)<input type="file" name="files" multiple accept=".jpg,.jpeg,.png,.pdf,.docx"></label><button>Đăng thông báo</button></form><p id="error" class="error"></p></div>`}
-  <div class="card"><h2>Thông báo lớp</h2>${notices.length?notices.map(n=>`<article style="padding:14px 0;border-bottom:1px solid #eee"><div class="row"><strong>${esc(n.title)}</strong><span class="tag">${esc(vnTime(n.created_at))}</span></div>${n.audience==='selected'?`<p class="muted">🔒 Thông báo riêng: ${esc(n.target_names||'Phụ huynh được chọn')}</p>`:''}<p class="notice">${esc(n.body)}</p><small class="muted">Người đăng: ${esc(n.author)}</small><div id="attachments-${n.id}" class="attachments"></div>${user.role==='parent'?`<div style="margin-top:10px"><button data-read="${n.id}" ${n.is_read?'disabled':''}>${n.is_read?'✓ Đã đọc':'Xác nhận đã đọc'}</button></div>`:`<div style="margin-top:8px"><button class="secondary" data-count="${n.id}">Ai đã đọc / chưa đọc?</button> <button class="secondary" data-delete-notice="${n.id}">Xóa thông báo</button> <div id="count-${n.id}"></div><label>Thêm tệp cho thông báo này<input type="file" data-attach="${n.id}" accept=".jpg,.jpeg,.png,.pdf,.docx"></label></div>`}</article>`).join(''):'Chưa có thông báo'}</div>`;
+  ${user.role==='parent'?`<div class="card"><h2>💬 Phản hồi</h2><p class="muted">Chọn thông báo cần trao đổi. Nội dung chỉ hiển thị cho gia đình và giáo viên phụ trách.</p>${notices.length?notices.map(n=>`<div class="row mini-record"><span>${esc(n.title)}</span><button class="secondary" data-open-parent-reply="${n.id}">Viết / Xem phản hồi</button></div><div id="parent-thread-${n.id}"></div>`).join(''):'Chưa có thông báo để phản hồi.'}</div>`:''}
+  ${user.role==='parent'?`<div class="card"><h2>📝 Đơn xin nghỉ học</h2><form id="absenceForm"><label>Học sinh<select name="student_id" required>${students.map(x=>`<option value="${x.id}">${esc(x.name)} (${esc(x.code)})</option>`).join('')}</select></label><label>Ngày xin nghỉ<input type="date" name="absence_date" required></label><label>Buổi học<select name="session"><option value="morning">Sáng</option><option value="afternoon">Chiều</option><option value="full">Cả ngày</option></select></label><label>Lý do<textarea name="reason" maxlength="1000" required placeholder="Nhập lý do xin nghỉ"></textarea></label><label class="row"><input type="checkbox" name="confirmed" required style="width:auto;margin:0"> Tôi xác nhận thông tin trên là đúng</label><button type="submit">Gửi đơn xin nghỉ</button></form><p class="muted">Đơn chỉ có hiệu lực sau khi giáo viên xử lý theo quy định nhà trường.</p></div>`:`<div class="card"><h2>📥 Hộp thư phụ huynh</h2><p class="muted">Các phản hồi được gửi riêng, không hiển thị cho phụ huynh khác.</p><div id="replyInbox">Đang tải...</div></div><div class="card"><h2>📋 Duyệt đơn nghỉ học</h2><div id="absenceInbox">Đang tải...</div></div>`}
+  ${user.role==='parent'?`<div class="card"><h2>📋 Đơn xin nghỉ đã gửi</h2><div id="absenceInbox">Đang tải...</div></div>`:''}
+  <div class="card"><h2>Thông báo lớp</h2>${notices.length?notices.map(n=>`<article style="padding:14px 0;border-bottom:1px solid #eee"><div class="row"><strong>${esc(n.title)}</strong><span class="tag">${esc(vnTime(n.created_at))}</span></div>${n.audience==='selected'?`<p class="muted">🔒 Thông báo riêng: ${esc(n.target_names||'Phụ huynh được chọn')}</p>`:''}<p class="notice">${esc(n.body)}</p><small class="muted">Người đăng: ${esc(n.author)}</small><div id="attachments-${n.id}" class="attachments"></div>${user.role==='parent'?`<div style="margin-top:10px"><button data-read="${n.id}" ${n.is_read?'disabled':''}>${n.is_read?'✓ Đã đọc':'Xác nhận đã đọc'}</button> <button class="secondary" data-replies="${n.id}">💬 Phản hồi</button><div id="reply-thread-${n.id}"></div></div>`:`<div style="margin-top:8px"><button class="secondary" data-count="${n.id}">Ai đã đọc / chưa đọc?</button> <button class="secondary" data-delete-notice="${n.id}">Xóa thông báo</button> <div id="count-${n.id}"></div><label>Thêm tệp cho thông báo này<input type="file" data-attach="${n.id}" accept=".jpg,.jpeg,.png,.pdf,.docx"></label></div>`}</article>`).join(''):'Chưa có thông báo'}</div>`;
+  if(user.role==='parent'){
+    const form=$('#absenceForm');if(form){form.querySelector('[name="absence_date"]').value=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Ho_Chi_Minh',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
+    form.onsubmit=async e=>{e.preventDefault();const f=new FormData(form);try{await api('/absence-requests',{method:'POST',body:JSON.stringify({student_id:Number(f.get('student_id')),absence_date:f.get('absence_date'),session:f.get('session'),reason:f.get('reason')})});alert('Đã gửi đơn. Vui lòng chờ giáo viên xử lý.');await load()}catch(err){error(err)}};}
+  }
+  await renderAbsence();
+  if(user.role!=='parent')await renderReplyInbox();
+  document.querySelectorAll('[data-replies]').forEach(b=>b.onclick=()=>showReplyThread(Number(b.dataset.replies),null,'#reply-thread-'+b.dataset.replies).catch(error));
+  document.querySelectorAll('[data-open-parent-reply]').forEach(b=>b.onclick=()=>showReplyThread(Number(b.dataset.openParentReply),null,'#parent-thread-'+b.dataset.openParentReply).catch(error));
   if(user.role==='admin'){const nav=document.createElement('div');nav.className='card';nav.innerHTML='<button id="adminPanel">⚙️ Quản trị lớp và tài khoản</button>';$('#app').prepend(nav);$('#adminPanel').onclick=()=>adminView().catch(error)}
   setupPasswordToggles();
   if(user.role==='parent'){ $('#enablePush').onclick=()=>enablePush().catch(error);$('#disablePush').onclick=()=>disablePush().catch(error) }
@@ -115,4 +126,35 @@ async function disablePush(){
  const registration=await navigator.serviceWorker.ready;const sub=await registration.pushManager.getSubscription();
  if(sub){await api('/push/unsubscribe',{method:'POST',body:JSON.stringify(sub.toJSON())});await sub.unsubscribe()}
  $('#pushStatus').textContent='Đã tắt thông báo trên thiết bị này';
+}
+
+// Smart Class 4.4: secure feedback and leave request UI.
+const absenceLabels={pending:'Chờ xử lý',approved:'Đã đồng ý',needs_info:'Cần bổ sung',rejected:'Không đồng ý'};
+const sessionLabels={morning:'Sáng',afternoon:'Chiều',full:'Cả ngày'};
+async function renderAbsence(){
+ const box=$('#absenceInbox');if(!box)return;
+ try{
+  const rows=await api('/absence-requests?class_id='+selected);
+  box.innerHTML=rows.length?rows.map(x=>`<article class="mini-record"><div class="row"><strong>${esc(x.student_name)}</strong><span class="tag">${esc(absenceLabels[x.status]||x.status)}</span></div><p>Ngày ${esc(x.absence_date)} · ${esc(sessionLabels[x.session])}<br><span class="muted">Phụ huynh: ${esc(x.parent_name)}</span></p><p class="notice">${esc(x.reason)}</p>${x.teacher_note?`<p><b>Ý kiến giáo viên:</b> ${esc(x.teacher_note)}</p>`:''}${user.role!=='parent'&&x.status==='pending'?`<div class="row"><button data-review="${x.id}" data-status="approved">Đồng ý</button><button class="secondary" data-review="${x.id}" data-status="needs_info">Cần bổ sung</button><button class="secondary" data-review="${x.id}" data-status="rejected">Không đồng ý</button></div>`:''}</article>`).join(''):'Chưa có đơn xin nghỉ học.';
+  box.querySelectorAll('[data-review]').forEach(b=>b.onclick=async()=>{
+   const status=b.dataset.status;
+   const note=prompt('Ý kiến giáo viên (có thể để trống nếu đồng ý):','');if(note===null)return;
+   if(status!=='approved'&&!note.trim()){alert('Vui lòng nhập lý do cần bổ sung hoặc không đồng ý.');return}
+   try{await api('/absence-requests/'+b.dataset.review+'/review',{method:'POST',body:JSON.stringify({status,teacher_note:note})});await renderAbsence()}catch(e){error(e)}
+  });
+ }catch(e){box.textContent='Không tải được đơn: '+e.message}
+}
+async function renderReplyInbox(){
+ const box=$('#replyInbox');if(!box)return;
+ try{const rows=await api('/replies/inbox?class_id='+selected);
+  box.innerHTML=rows.length?rows.map(x=>`<div class="mini-record"><div class="row"><div><strong>${esc(x.parent_name)}</strong><p class="muted">${esc(x.title)} · ${esc(vnTime(x.last_reply_at))}</p></div><button class="secondary" data-open-reply="${x.notice_id}" data-parent="${x.parent_id}">Xem / Trả lời</button></div><div id="inbox-thread-${x.notice_id}-${x.parent_id}"></div></div>`).join(''):'Chưa có phản hồi từ phụ huynh.';
+  box.querySelectorAll('[data-open-reply]').forEach(b=>b.onclick=()=>showReplyThread(Number(b.dataset.openReply),Number(b.dataset.parent),'#inbox-thread-'+b.dataset.openReply+'-'+b.dataset.parent).catch(error));
+ }catch(e){box.textContent='Không tải được hộp thư: '+e.message}
+}
+async function showReplyThread(noticeId,parentId,targetSelector){
+ const box=$(targetSelector);if(!box)return;
+ const q=parentId?'?parent_id='+parentId:'';
+ const messages=await api('/notices/'+noticeId+'/replies'+q);
+ box.innerHTML=`<div class="thread">${messages.length?messages.map(m=>`<p><b>${esc(m.sender_name)}</b> <small class="muted">${esc(vnTime(m.created_at))}</small><span class="notice">${esc(m.body)}</span></p>`).join(''):'<p class="muted">Chưa có phản hồi.</p>'}<form class="replyForm"><label>Nội dung phản hồi<textarea name="body" maxlength="2000" required></textarea></label><button>Gửi phản hồi</button></form></div>`;
+ box.querySelector('form').onsubmit=async e=>{e.preventDefault();const body=new FormData(e.target).get('body');try{await api('/notices/'+noticeId+'/replies',{method:'POST',body:JSON.stringify({body,parent_id:parentId})});await showReplyThread(noticeId,parentId,targetSelector)}catch(err){error(err)}};
 }
