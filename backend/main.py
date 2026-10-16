@@ -73,6 +73,9 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS notice_recipients(notice_id BIGINT NOT NULL REFERENCES notices(id) ON DELETE CASCADE, parent_id BIGINT NOT NULL REFERENCES users(id), PRIMARY KEY(notice_id,parent_id))",
             "CREATE TABLE IF NOT EXISTS notice_attachments(id BIGSERIAL PRIMARY KEY, notice_id BIGINT NOT NULL REFERENCES notices(id) ON DELETE CASCADE, object_key TEXT UNIQUE NOT NULL, filename TEXT NOT NULL, content_type TEXT NOT NULL, file_size INTEGER NOT NULL CHECK(file_size > 0), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
             "CREATE INDEX IF NOT EXISTS idx_notice_recipients_parent ON notice_recipients(parent_id)",
+            "ALTER TABLE notices ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
+            "ALTER TABLE notices ADD COLUMN IF NOT EXISTS audience TEXT NOT NULL DEFAULT 'class'",
+            "CREATE TABLE IF NOT EXISTS notice_targets(notice_id BIGINT NOT NULL REFERENCES notices(id) ON DELETE CASCADE, student_id BIGINT NOT NULL REFERENCES students(id), PRIMARY KEY(notice_id,student_id))",
             "CREATE TABLE IF NOT EXISTS push_subscriptions(id BIGSERIAL PRIMARY KEY,parent_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,endpoint TEXT UNIQUE NOT NULL,subscription_json TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
             "CREATE INDEX IF NOT EXISTS idx_push_parent ON push_subscriptions(parent_id)",
             "CREATE TABLE IF NOT EXISTS notice_reminders(notice_id BIGINT NOT NULL REFERENCES notices(id) ON DELETE CASCADE,parent_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(notice_id,parent_id))",
@@ -164,6 +167,7 @@ class NoticeIn(BaseModel):
     class_id:int
     title:str=Field(min_length=1,max_length=120)
     body:str=Field(min_length=1,max_length=3000)
+    student_ids:list[int]=Field(default_factory=list,max_length=100)
 @app.post("/api/login")
 def login(payload:Login,response:Response,request:Request):
     csrf(request)
@@ -205,37 +209,71 @@ def students(class_id:int,u=Depends(current_user)):
 def notices(class_id:int,u=Depends(current_user)):
     with db() as c:
         can_class(c,u,class_id)
-        rows=c.execute("""SELECT n.id,n.class_id,n.title,n.body,n.created_at,
+        # Parents may see only announcements explicitly addressed to them.
+        sql="""SELECT n.id,n.class_id,n.title,n.body,n.created_at,n.audience,
             a.name AS author,
-            EXISTS(SELECT 1 FROM notice_reads r WHERE r.notice_id=n.id AND r.parent_id=?) AS is_read
-            FROM notices n JOIN users a ON a.id=n.author_id WHERE n.class_id=?
-            ORDER BY n.id DESC LIMIT 100""",(u["id"],class_id))
-        return [dict(r) for r in rows]
+            EXISTS(SELECT 1 FROM notice_reads r WHERE r.notice_id=n.id AND r.parent_id=%s) AS is_read,
+            (SELECT STRING_AGG(DISTINCT st.name, ', ' ORDER BY st.name)
+             FROM notice_targets nt JOIN students st ON st.id=nt.student_id
+             WHERE nt.notice_id=n.id AND (%s <> 'parent' OR EXISTS (SELECT 1 FROM parent_students ps WHERE ps.student_id=st.id AND ps.parent_id=%s))) AS target_names
+            FROM notices n JOIN users a ON a.id=n.author_id
+            WHERE n.class_id=%s AND n.deleted_at IS NULL"""
+        args=[u["id"],u["role"],u["id"],class_id]
+        if u["role"]=="parent":
+            sql+=" AND EXISTS(SELECT 1 FROM notice_recipients nr WHERE nr.notice_id=n.id AND nr.parent_id=%s)"
+            args.append(u["id"])
+        sql+=" ORDER BY n.id DESC LIMIT 100"
+        return [dict(r) for r in c.execute(sql,tuple(args))]
+
 @app.post("/api/notices",status_code=201)
 def create_notice(payload:NoticeIn,request:Request,u=Depends(current_user)):
     csrf(request)
-    if u["role"] not in ("admin","teacher"):raise HTTPException(403,"Chỉ giáo viên được gửi thông báo")
+    if u["role"] not in ("admin","teacher"):raise HTTPException(403,"Chỉ giáo viên và quản trị viên được gửi thông báo")
+    ids=list(dict.fromkeys(payload.student_ids))
     with db() as c:
         can_class(c,u,payload.class_id)
-        cur=c.execute("INSERT INTO notices(class_id,author_id,title,body) VALUES(?,?,?,?)",
-            (payload.class_id,u["id"],payload.title.strip(),payload.body.strip()))
-        # Freeze the intended audience at publishing time.
-        c.execute("""INSERT INTO notice_recipients(notice_id,parent_id)
-            SELECT DISTINCT %s, ps.parent_id FROM students s
-            JOIN parent_students ps ON ps.student_id=s.id
-            JOIN users u ON u.id=ps.parent_id
-            WHERE s.class_id=%s AND s.deleted_at IS NULL AND u.active=1
-            ON CONFLICT DO NOTHING""",(cur.lastrowid,payload.class_id))
+        if ids:
+            matched={r["id"] for r in c.execute("SELECT id FROM students WHERE class_id=%s AND deleted_at IS NULL AND id=ANY(%s)",(payload.class_id,ids))}
+            if matched!=set(ids):raise HTTPException(400,"Danh sách học sinh nhận thông báo không hợp lệ")
+            recipients=[r["parent_id"] for r in c.execute("""SELECT DISTINCT ps.parent_id FROM parent_students ps
+                JOIN users p ON p.id=ps.parent_id AND p.active=1
+                WHERE ps.student_id=ANY(%s)""",(ids,))]
+            if not recipients:raise HTTPException(400,"Các học sinh đã chọn chưa liên kết với phụ huynh đang hoạt động")
+        cur=c.execute("INSERT INTO notices(class_id,author_id,title,body,audience) VALUES(?,?,?,?,?)",
+            (payload.class_id,u["id"],payload.title.strip(),payload.body.strip(),"selected" if ids else "class"))
         notice_id=cur.lastrowid
-    # The notice is committed before any external push requests.
-    send_push_for_notice(notice_id, kind="new")
-    return {"id":notice_id}
+        if ids:
+            c.executemany("INSERT INTO notice_targets(notice_id,student_id) VALUES(%s,%s)",[(notice_id,i) for i in ids])
+            c.executemany("INSERT INTO notice_recipients(notice_id,parent_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",[(notice_id,i) for i in recipients])
+        else:
+            c.execute("""INSERT INTO notice_recipients(notice_id,parent_id)
+                SELECT DISTINCT %s, ps.parent_id FROM students s
+                JOIN parent_students ps ON ps.student_id=s.id
+                JOIN users p ON p.id=ps.parent_id
+                WHERE s.class_id=%s AND s.deleted_at IS NULL AND p.active=1
+                ON CONFLICT DO NOTHING""",(notice_id,payload.class_id))
+        audit(c,u["id"],"create_private_notice" if ids else "create_class_notice",str(notice_id))
+    send_push_for_notice(notice_id,kind="new")
+    return {"id":notice_id,"audience":"selected" if ids else "class"}
+
+@app.delete("/api/notices/{notice_id}")
+def delete_notice(notice_id:int,request:Request,u=Depends(current_user)):
+    csrf(request)
+    if u["role"] not in ("admin","teacher"):raise HTTPException(403,"Chỉ giáo viên và quản trị viên được xóa thông báo")
+    with db() as c:
+        n=c.execute("SELECT class_id,deleted_at FROM notices WHERE id=%s",(notice_id,)).fetchone()
+        if not n or n["deleted_at"] is not None:raise HTTPException(404,"Không tìm thấy thông báo")
+        can_class(c,u,n["class_id"])
+        c.execute("UPDATE notices SET deleted_at=NOW() WHERE id=%s",(notice_id,))
+        audit(c,u["id"],"archive_notice",str(notice_id))
+    return {"ok":True,"message":"Đã ẩn thông báo khỏi phụ huynh và giáo viên"}
+
 @app.post("/api/notices/{notice_id}/read")
 def mark_read(notice_id:int,request:Request,u=Depends(current_user)):
     csrf(request)
     if u["role"]!="parent":raise HTTPException(403,"Chỉ phụ huynh xác nhận đã đọc")
     with db() as c:
-        n=c.execute("SELECT class_id FROM notices WHERE id=?",(notice_id,)).fetchone()
+        n=c.execute("SELECT class_id FROM notices WHERE id=? AND deleted_at IS NULL",(notice_id,)).fetchone()
         if not n:raise HTTPException(404,"Không có thông báo")
         can_class(c,u,n["class_id"])
         if not c.execute("SELECT 1 FROM notice_recipients WHERE notice_id=? AND parent_id=?",(notice_id,u["id"])).fetchone():
@@ -246,7 +284,7 @@ def mark_read(notice_id:int,request:Request,u=Depends(current_user)):
 def read_count(notice_id:int,u=Depends(current_user)):
     if u["role"]=="parent":raise HTTPException(403,"Không có quyền")
     with db() as c:
-        n=c.execute("SELECT class_id FROM notices WHERE id=?",(notice_id,)).fetchone()
+        n=c.execute("SELECT class_id FROM notices WHERE id=? AND deleted_at IS NULL",(notice_id,)).fetchone()
         if not n:raise HTTPException(404,"Không có thông báo")
         can_class(c,u,n["class_id"])
         count=c.execute("SELECT count(*) AS count FROM notice_reads r JOIN notice_recipients nr ON nr.notice_id=r.notice_id AND nr.parent_id=r.parent_id WHERE r.notice_id=?",(notice_id,)).fetchone()["count"]
@@ -437,7 +475,7 @@ def unlink_parent(parent_id:int,student_id:int,request:Request,u=Depends(current
 def read_status(notice_id:int,u=Depends(current_user)):
     if u["role"]=="parent":raise HTTPException(403,"Không có quyền")
     with db() as c:
-        n=c.execute("SELECT class_id FROM notices WHERE id=?",(notice_id,)).fetchone()
+        n=c.execute("SELECT class_id FROM notices WHERE id=? AND deleted_at IS NULL",(notice_id,)).fetchone()
         if not n:raise HTTPException(404,"Không tìm thấy thông báo")
         can_class(c,u,n["class_id"])
         rows=c.execute("""SELECT p.id,p.name,p.username,r.read_at,
@@ -476,7 +514,7 @@ async def upload_attachment(notice_id:int,request:Request,file:UploadFile=File(.
     csrf(request)
     if u["role"] not in ("admin","teacher"):raise HTTPException(403,"Không có quyền")
     with db() as c:
-        n=c.execute("SELECT class_id FROM notices WHERE id=?",(notice_id,)).fetchone()
+        n=c.execute("SELECT class_id FROM notices WHERE id=? AND deleted_at IS NULL",(notice_id,)).fetchone()
         if not n:raise HTTPException(404,"Không tìm thấy thông báo")
         can_class(c,u,n["class_id"])
         if c.execute("SELECT COUNT(*) AS n FROM notice_attachments WHERE notice_id=?",(notice_id,)).fetchone()["n"]>=5:
@@ -505,7 +543,7 @@ async def upload_attachment(notice_id:int,request:Request,file:UploadFile=File(.
 @app.get("/api/notices/{notice_id}/attachments")
 def list_attachments(notice_id:int,u=Depends(current_user)):
     with db() as c:
-        n=c.execute("SELECT class_id FROM notices WHERE id=?",(notice_id,)).fetchone()
+        n=c.execute("SELECT class_id FROM notices WHERE id=? AND deleted_at IS NULL",(notice_id,)).fetchone()
         if not n:raise HTTPException(404,"Không tìm thấy thông báo")
         can_class(c,u,n["class_id"])
         if u["role"]=="parent" and not c.execute("SELECT 1 FROM notice_recipients WHERE notice_id=? AND parent_id=?",(notice_id,u["id"])).fetchone():
@@ -516,7 +554,7 @@ def list_attachments(notice_id:int,u=Depends(current_user)):
 def download_attachment(attachment_id:int,u=Depends(current_user)):
     with db() as c:
         row=c.execute("""SELECT a.*,n.class_id,n.id AS notice_id FROM notice_attachments a
-            JOIN notices n ON n.id=a.notice_id WHERE a.id=?""",(attachment_id,)).fetchone()
+            JOIN notices n ON n.id=a.notice_id WHERE a.id=? AND n.deleted_at IS NULL""",(attachment_id,)).fetchone()
         if not row:raise HTTPException(404,"Không tìm thấy tệp")
         can_class(c,u,row["class_id"])
         if u["role"]=="parent" and not c.execute("SELECT 1 FROM notice_recipients WHERE notice_id=? AND parent_id=?",(row["notice_id"],u["id"])).fetchone():
@@ -537,7 +575,7 @@ def delete_attachment(attachment_id:int,request:Request,u=Depends(current_user))
     if u["role"] not in ("admin","teacher"):raise HTTPException(403,"Không có quyền")
     with db() as c:
         row=c.execute("""SELECT a.object_key,n.class_id FROM notice_attachments a
-            JOIN notices n ON n.id=a.notice_id WHERE a.id=?""",(attachment_id,)).fetchone()
+            JOIN notices n ON n.id=a.notice_id WHERE a.id=? AND n.deleted_at IS NULL AND n.deleted_at IS NULL""",(attachment_id,)).fetchone()
         if not row:raise HTTPException(404,"Không tìm thấy tệp")
         can_class(c,u,row["class_id"])
     client,bucket=r2_client()
@@ -579,7 +617,7 @@ def send_push_for_notice(notice_id,kind="new",parent_ids=None):
         log.warning("Web Push not configured: set VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT")
         return {"sent":0,"failed":0,"not_configured":True}
     with db() as c:
-        n=c.execute("SELECT id,title,class_id FROM notices WHERE id=?",(notice_id,)).fetchone()
+        n=c.execute("SELECT id,title,class_id,audience FROM notices WHERE id=? AND deleted_at IS NULL",(notice_id,)).fetchone()
         if not n:return {"sent":0,"failed":0}
         sql="""SELECT ps.id,ps.parent_id,ps.subscription_json FROM push_subscriptions ps
             JOIN notice_recipients nr ON nr.parent_id=ps.parent_id
@@ -595,7 +633,7 @@ def send_push_for_notice(notice_id,kind="new",parent_ids=None):
     counts={"sent":0,"failed":0,"expired":0}
     for sub in subscriptions:
         status=push_one(sub,"Smart Class — Nhắc xem thông báo" if kind=="reminder" else "Smart Class — Thông báo mới",
-                        "Quý phụ huynh có thông báo cần xem." if kind=="reminder" else n["title"],
+                        "Quý phụ huynh có thông báo cần xem." if kind=="reminder" else ("Có thông báo riêng mới" if n.get("audience")=="selected" else n["title"]),
                         "/?notice="+str(notice_id))
         counts[status]+=1
         with db() as c:
@@ -639,7 +677,7 @@ def remind_unread(notice_id:int,payload:ReminderIn,request:Request,u=Depends(cur
     csrf(request)
     if u["role"] not in ("admin","teacher"):raise HTTPException(403,"Không có quyền")
     with db() as c:
-        n=c.execute("SELECT class_id FROM notices WHERE id=?",(notice_id,)).fetchone()
+        n=c.execute("SELECT class_id FROM notices WHERE id=? AND deleted_at IS NULL",(notice_id,)).fetchone()
         if not n:raise HTTPException(404,"Không tìm thấy thông báo")
         can_class(c,u,n["class_id"])
         sql="""SELECT nr.parent_id FROM notice_recipients nr JOIN users us ON us.id=nr.parent_id AND us.active=1
